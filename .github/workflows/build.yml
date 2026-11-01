@@ -1,0 +1,131 @@
+name: Build compatible release
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 上游版本号（如 v2.0.3），留空取上游最新正式版
+        required: false
+        default: ''
+      rebuild:
+        description: 已发布过也重新编译并覆盖
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-compatible-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Willxup/cpa-usage-keeper
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve upstream version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if [ "${REBUILD:-false}" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "${tag} already published"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        run: |
+          npm --prefix ./web ci
+          npm --prefix ./web run build
+
+      - name: Build binary package
+        run: |
+          set -euo pipefail
+          package_name="cpa-usage-keeper_${TAG}_linux_amd64"
+          package_dir="dist/${package_name}"
+          mkdir -p "${package_dir}/data"
+
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 \
+          CGO_CFLAGS="-O2 -g -march=x86-64 -mtune=generic" \
+            go build -trimpath -ldflags="-s -w -X cpa-usage-keeper/internal/version.Version=${TAG}" -o "${package_dir}/cpa-usage-keeper" ./cmd/server/main.go
+          cp .env.example README.md README.zh.md LICENSE "${package_dir}/"
+          cp -R docs "${package_dir}/"
+          cp deploy/cpa-usage-keeper.example.service "${package_dir}/cpa-usage-keeper.service"
+          echo "PACKAGE_NAME=${package_name}" >> "$GITHUB_ENV"
+
+      - name: Verify CPU baseline
+        run: |
+          set -euo pipefail
+          isa="$(readelf -n "dist/${PACKAGE_NAME}/cpa-usage-keeper" | grep -i 'x86 ISA needed' || true)"
+          echo "${isa:-no x86 ISA note}"
+          if echo "$isa" | grep -Eq 'x86-64-v[234]'; then
+            echo "::error::binary requires CPU features above x86-64 baseline"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar -czf "dist/${PACKAGE_NAME}.tar.gz" -C dist "${PACKAGE_NAME}"
+          (cd dist && sha256sum "${PACKAGE_NAME}.tar.gz" > checksums.txt)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=("dist/${PACKAGE_NAME}.tar.gz" "dist/checksums.txt")
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "由上游 ${UPSTREAM} ${TAG} 源码编译的 Linux amd64 版本，只要求基础 x86-64 指令集，不需要 AVX2。上游发布页：https://github.com/${UPSTREAM}/releases/tag/${TAG}"
+          fi
